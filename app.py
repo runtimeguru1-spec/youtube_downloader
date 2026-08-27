@@ -508,7 +508,7 @@ def _video_encode_args(encoder, preset):
         return ['-c:v', 'h264_qsv', '-preset', preset if preset in ('veryfast', 'faster', 'fast', 'medium', 'slow', 'slower', 'veryslow') else 'veryfast', '-global_quality', '20']
     if encoder == 'h264_amf':
         return ['-c:v', 'h264_amf', '-quality', 'speed', '-rc', 'cqp', '-qp_i', '20', '-qp_p', '20', '-qp_b', '20']
-    return ['-c:v', 'libx264', '-preset', preset, '-crf', '20']
+    return ['-c:v', 'copy', '-preset', preset, '-crf', '20']
 
 
 def _run_ffmpeg_with_progress(cmd, download_id, duration, stall_seconds=FFMPEG_STALL_SECONDS, max_seconds=FFMPEG_MAX_SECONDS):
