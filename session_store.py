@@ -52,8 +52,21 @@ def _get_redis():
                         '(lost on restart, not shared across workers). Fine for local dev only.')
         return None
     import redis
-    _redis = redis.from_url(url)
+    client = redis.from_url(url, socket_connect_timeout=5, socket_timeout=5)
+    try:
+        client.ping()
+        logger.info('Connected to Redis for per-device session storage.')
+    except redis.exceptions.RedisError as e:
+        # Fail loud in the log but not in the request: callers still get a normal
+        # ConnectionError raised on their own get/set, which the Flask error
+        # handler turns into a clean JSON 500 — never an HTML page.
+        logger.error(f'Redis at REDIS_URL is unreachable ({e.__class__.__name__}) - '
+                      'per-device sessions will fail until this is fixed.')
+    _redis = client
     return _redis
+
+
+_get_redis()  # one-time startup connectivity check, logged above
 
 
 def _store_set(key, obj, ttl):
@@ -130,6 +143,24 @@ def _fernet():
     except (ValueError, TypeError) as e:
         logger.error(f'SESSION_ENCRYPTION_KEY is set but invalid: {e}')
         return None
+
+
+def _log_encryption_key_status():
+    """One-time startup log (never the key itself) so a missing/invalid
+    SESSION_ENCRYPTION_KEY shows up immediately in Railway logs instead of only
+    surfacing the first time someone tries to connect a session."""
+    if _fernet() is not None:
+        logger.info('SESSION_ENCRYPTION_KEY is configured and valid.')
+    elif os.environ.get('SESSION_ENCRYPTION_KEY'):
+        logger.error('SESSION_ENCRYPTION_KEY is set but invalid - per-device session storage will '
+                      'return SERVER_MISCONFIGURED until this is fixed.')
+    else:
+        logger.warning('SESSION_ENCRYPTION_KEY not set - per-device session storage (Connect YouTube '
+                        'Session) is disabled until this is configured. Device registration and the '
+                        'shared/global YOUTUBE_COOKIES fallback still work.')
+
+
+_log_encryption_key_status()
 
 
 _COOKIE_LINE_RE = re.compile(

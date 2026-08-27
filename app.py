@@ -27,7 +27,6 @@ import threading
 import subprocess
 from bs4 import BeautifulSoup
 import re
-import session_store
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 2 * 1024 * 1024  # 2MB - generous for a cookies.txt upload, tight enough to block abuse
@@ -73,6 +72,12 @@ if not logger.handlers:
     _handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s'))
     logger.addHandler(_handler)
     logger.propagate = False
+
+# Imported only after the 'downloader' logger above is fully configured —
+# session_store logs its Redis/SESSION_ENCRYPTION_KEY startup diagnostics at
+# import time, and importing it any earlier means those lines print
+# unformatted (or get silently dropped) because the logger has no handler yet.
+import session_store
 
 
 def _stage_log(download_id, stage, message=''):

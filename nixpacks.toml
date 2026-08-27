@@ -5,4 +5,10 @@ nixPkgs = ["python313", "ffmpeg", "deno"]
 cmds = ["pip install -r requirements.txt"]
 
 [start]
-cmd = "gunicorn app:app --bind 0.0.0.0:$PORT"
+# --timeout 300: yt-dlp calls (JS-challenge solving via deno, retried YouTube
+# requests) routinely take well past gunicorn's 30s default worker timeout.
+# Without this, gunicorn SIGKILLs the worker mid-request on a slow extract,
+# and Railway's edge returns its own HTML error page for the dropped
+# connection — which is what the Chrome extension actually hit ("Unexpected
+# token '<'"), not a bug in Flask's own JSON error handling.
+cmd = "gunicorn app:app --bind 0.0.0.0:$PORT --timeout 300"

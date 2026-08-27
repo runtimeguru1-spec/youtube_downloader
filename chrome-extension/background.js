@@ -11,6 +11,67 @@ function log(...args) {
   if (DEV_MODE) console.log('[YT-DL/bg]', ...args);
 }
 
+// Every backend call must go through this instead of `fetch(...).then(r =>
+// r.json())` directly. A Railway/gunicorn-level failure (worker timeout,
+// deploy crash, edge 502/504) never reaches our Flask app at all — it comes
+// back as an HTML error page from the platform's own proxy, and blindly
+// calling .json() on that throws the opaque "Unexpected token '<'" error.
+// This reads the body as text first, checks Content-Type, and only then
+// parses JSON, so every caller gets either real data or a clear Error.
+async function fetchBackendJson(url, options = {}) {
+  let response;
+  try {
+    response = await fetch(url, options);
+  } catch (e) {
+    throw new Error('Could not reach the backend. Check your connection and try again.');
+  }
+
+  let text;
+  try {
+    text = await response.text();
+  } catch (e) {
+    throw new Error(`Backend returned HTTP ${response.status} and its body could not be read.`);
+  }
+
+  const contentType = response.headers.get('Content-Type') || '';
+  const isJson = contentType.toLowerCase().includes('application/json');
+
+  if (!isJson || (text && !looksLikeJsonText(text))) {
+    if (DEV_MODE) {
+      // Safe diagnostic only: endpoint, status, content-type, a short body
+      // preview. Never logs request headers, so the device token/cookies
+      // this call may have sent are never at risk of ending up here.
+      log('non-JSON backend response', {
+        url,
+        status: response.status,
+        contentType,
+        bodyPreview: text.slice(0, 200),
+      });
+    }
+    throw new Error(`Backend returned HTTP ${response.status} instead of JSON. Check Railway deployment logs.`);
+  }
+
+  if (!text) {
+    return { status: response.status, ok: response.ok, data: {} };
+  }
+
+  try {
+    return { status: response.status, ok: response.ok, data: JSON.parse(text) };
+  } catch (e) {
+    if (DEV_MODE) {
+      log('backend claimed JSON but body failed to parse', {
+        url, status: response.status, bodyPreview: text.slice(0, 200),
+      });
+    }
+    throw new Error(`Backend returned HTTP ${response.status} instead of JSON. Check Railway deployment logs.`);
+  }
+}
+
+function looksLikeJsonText(text) {
+  const trimmed = text.trimStart();
+  return trimmed.startsWith('{') || trimmed.startsWith('[');
+}
+
 // ---- Per-device identity ----
 // Every extension installation gets its own device_id + secret device_token
 // from POST /device/register, persisted in chrome.storage.local so it
@@ -24,8 +85,7 @@ async function ensureDevice() {
     return { device_id: stored.device_id, device_token: stored.device_token };
   }
   log('no device identity yet, registering');
-  const response = await fetch(`${BACKEND_URL}/device/register`, { method: 'POST' });
-  const data = await response.json();
+  const { data } = await fetchBackendJson(`${BACKEND_URL}/device/register`, { method: 'POST' });
   if (!data.success) throw new Error(data.message || 'Device registration failed.');
   await chrome.storage.local.set({ device_id: data.device_id, device_token: data.device_token });
   log('device registered', data.device_id);
@@ -39,35 +99,34 @@ async function authHeaders(extra = {}) {
 
 async function checkQualities(url) {
   const headers = await authHeaders({ 'Content-Type': 'application/json' });
-  const response = await fetch(`${BACKEND_URL}/youtube/qualities`, {
+  const { ok, data } = await fetchBackendJson(`${BACKEND_URL}/youtube/qualities`, {
     method: 'POST',
     headers,
     body: JSON.stringify({ url }),
   });
-  const data = await response.json();
-  return { ok: response.ok, data };
+  return { ok, data };
 }
 
 async function connectSession(cookiesText) {
   const headers = await authHeaders({ 'Content-Type': 'application/json' });
-  const response = await fetch(`${BACKEND_URL}/youtube/session`, {
+  const { data } = await fetchBackendJson(`${BACKEND_URL}/youtube/session`, {
     method: 'POST',
     headers,
     body: JSON.stringify({ cookies: cookiesText }),
   });
-  return response.json();
+  return data;
 }
 
 async function disconnectSession() {
   const headers = await authHeaders();
-  const response = await fetch(`${BACKEND_URL}/youtube/session`, { method: 'DELETE', headers });
-  return response.json();
+  const { data } = await fetchBackendJson(`${BACKEND_URL}/youtube/session`, { method: 'DELETE', headers });
+  return data;
 }
 
 async function getSessionStatus() {
   const headers = await authHeaders();
-  const response = await fetch(`${BACKEND_URL}/youtube/session/status`, { method: 'GET', headers });
-  return response.json();
+  const { data } = await fetchBackendJson(`${BACKEND_URL}/youtube/session/status`, { method: 'GET', headers });
+  return data;
 }
 
 function basename(path) {
@@ -131,17 +190,17 @@ async function startDownload(videoUrl, payload) {
   let data;
   try {
     const headers = await authHeaders({ 'Content-Type': 'application/json' });
-    const response = await fetch(`${BACKEND_URL}/download`, {
+    const result = await fetchBackendJson(`${BACKEND_URL}/download`, {
       method: 'POST',
       headers,
       body: JSON.stringify(payload),
     });
-    data = await response.json();
+    data = result.data;
   } catch (e) {
-    const failed = await setState(videoUrl, { ...entry, status: 'failed', error: 'Could not reach the backend.' });
+    const failed = await setState(videoUrl, { ...entry, status: 'failed', error: e.message });
     broadcast(videoUrl, failed);
-    log('backend unreachable', e.message);
-    return { ok: false, message: 'Could not reach the backend.' };
+    log('backend unreachable or non-JSON', e.message);
+    return { ok: false, message: e.message };
   }
 
   log('backend response', data);
