@@ -29,6 +29,13 @@ const el = {
   spinner: document.getElementById('spinner'),
   statusText: document.getElementById('status-text'),
   errorBox: document.getElementById('error-box'),
+  sessionStatus: document.getElementById('session-status'),
+  connectSessionBtn: document.getElementById('connect-session-btn'),
+  disconnectSessionBtn: document.getElementById('disconnect-session-btn'),
+  connectSessionForm: document.getElementById('connect-session-form'),
+  sessionCookiesInput: document.getElementById('session-cookies-input'),
+  submitSessionBtn: document.getElementById('submit-session-btn'),
+  cancelSessionBtn: document.getElementById('cancel-session-btn'),
 };
 
 // ---- UI helpers ----
@@ -52,6 +59,78 @@ function clearError() {
 function friendlyCheckError(rawMessage) {
   return rawMessage || 'Could not check this video.';
 }
+
+// ---- YouTube session (per-device, explicitly connected by the user) ----
+function renderSessionUI(status) {
+  if (status && status.connected) {
+    el.sessionStatus.textContent = '✓ Connected — using your own YouTube session';
+    el.sessionStatus.classList.remove('notice-error');
+    el.sessionStatus.classList.add('notice-success');
+    el.connectSessionBtn.classList.add('hidden');
+    el.disconnectSessionBtn.classList.remove('hidden');
+  } else {
+    el.sessionStatus.textContent = 'Not connected — using the shared server session, if any (may hit YouTube sign-in checks).';
+    el.sessionStatus.classList.remove('notice-success', 'notice-error');
+    el.connectSessionBtn.classList.remove('hidden');
+    el.disconnectSessionBtn.classList.add('hidden');
+  }
+  el.connectSessionForm.classList.add('hidden');
+}
+
+async function refreshSessionStatus() {
+  try {
+    const data = await chrome.runtime.sendMessage({ type: 'SESSION_STATUS' });
+    renderSessionUI(data);
+  } catch (e) {
+    el.sessionStatus.textContent = 'Could not check session status.';
+    el.sessionStatus.classList.add('notice-error');
+  }
+}
+
+el.connectSessionBtn.addEventListener('click', () => {
+  el.connectSessionForm.classList.remove('hidden');
+  el.sessionCookiesInput.focus();
+});
+
+el.cancelSessionBtn.addEventListener('click', () => {
+  el.connectSessionForm.classList.add('hidden');
+  el.sessionCookiesInput.value = '';
+});
+
+el.submitSessionBtn.addEventListener('click', async () => {
+  const cookies = el.sessionCookiesInput.value;
+  if (!cookies.trim()) {
+    showError('Paste your cookies.txt contents first.');
+    return;
+  }
+  el.submitSessionBtn.disabled = true;
+  el.submitSessionBtn.textContent = 'Saving...';
+  clearError();
+  try {
+    const data = await chrome.runtime.sendMessage({ type: 'CONNECT_SESSION', cookies });
+    if (!data.success) {
+      showError(data.message || 'Could not save the session.');
+    } else {
+      el.sessionCookiesInput.value = '';
+      await refreshSessionStatus();
+    }
+  } catch (e) {
+    showError('Could not reach the backend to save the session.');
+  } finally {
+    el.submitSessionBtn.disabled = false;
+    el.submitSessionBtn.textContent = 'Save Session';
+  }
+});
+
+el.disconnectSessionBtn.addEventListener('click', async () => {
+  el.disconnectSessionBtn.disabled = true;
+  try {
+    await chrome.runtime.sendMessage({ type: 'DISCONNECT_SESSION' });
+    await refreshSessionStatus();
+  } finally {
+    el.disconnectSessionBtn.disabled = false;
+  }
+});
 
 async function checkBackendReachable() {
   try {
@@ -141,15 +220,10 @@ async function onCheckVideoClick() {
   el.backendOffline.classList.add('hidden');
 
   try {
-    const res = await fetch(`${BACKEND_URL}/youtube/qualities`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url: state.videoUrl }),
-    });
-    const data = await res.json();
-    log('quality response received', { ok: res.ok, success: data.success });
+    const { ok, data } = await chrome.runtime.sendMessage({ type: 'CHECK_QUALITIES', url: state.videoUrl });
+    log('quality response received', { ok, success: data.success });
 
-    if (!res.ok || !data.success) {
+    if (!ok || !data.success) {
       showError(friendlyCheckError(data.message));
       setStatus('Failed');
       return;
@@ -302,6 +376,7 @@ async function init() {
 
   const reachable = await checkBackendReachable();
   el.backendOffline.classList.toggle('hidden', reachable);
+  if (reachable) refreshSessionStatus();
 
   // Restore any in-progress/completed/failed download state for this exact
   // video so reopening the popup mid-download shows the real status instead

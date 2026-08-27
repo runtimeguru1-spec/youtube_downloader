@@ -19,15 +19,18 @@ from fake_useragent import UserAgent
 import time
 import random
 import mimetypes
-from flask import Flask, render_template, request, jsonify, send_file
+from flask import Flask, request, jsonify, send_file, g
 from werkzeug.exceptions import HTTPException
 from urllib.parse import urlparse
+from functools import wraps
 import threading
 import subprocess
 from bs4 import BeautifulSoup
 import re
+import session_store
 
 app = Flask(__name__)
+app.config['MAX_CONTENT_LENGTH'] = 2 * 1024 * 1024  # 2MB - generous for a cookies.txt upload, tight enough to block abuse
 
 # CORS for the companion Chrome extension. Extension pages (popup/background)
 # send an `Origin: chrome-extension://<32-char-id>` header on cross-origin
@@ -44,8 +47,8 @@ def _add_cors_headers(response):
     origin = request.headers.get('Origin', '')
     if origin and (_CORS_ORIGIN_RE.match(origin) or origin in _CORS_ALLOWED_ORIGINS):
         response.headers['Access-Control-Allow-Origin'] = origin
-        response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
-        response.headers['Access-Control-Allow-Headers'] = 'Content-Type'
+        response.headers['Access-Control-Allow-Methods'] = 'GET, POST, DELETE, OPTIONS'
+        response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, X-Device-Id'
         response.headers['Vary'] = 'Origin'
     return response
 
@@ -262,6 +265,88 @@ def _is_rate_limited(key):
         _rate_limit_hits[key] = hits
         return len(hits) > _RATE_LIMIT_MAX_REQUESTS
 
+
+# --- Per-device auth (device_id + bearer token) for the multi-office-PC setup
+# YOUTUBE_COOKIES/_N above remains as an optional fallback/admin session used
+# whenever a request has no device auth, or its device hasn't connected its
+# own session yet. -----------------------------------------------------------
+
+class DeviceAuthError(Exception):
+    """Raised when X-Device-Id/Authorization headers were sent but are invalid."""
+
+
+def _extract_bearer_token():
+    auth = request.headers.get('Authorization', '')
+    if auth.startswith('Bearer '):
+        return auth[len('Bearer '):].strip()
+    return None
+
+
+def _resolve_authenticated_device():
+    """Returns the verified device_id for this request, or None if no device
+    auth headers were sent at all (caller should fall back to the shared
+    global/admin cookiefile). Raises DeviceAuthError if headers were sent but
+    don't verify."""
+    device_id = request.headers.get('X-Device-Id', '').strip()
+    token = _extract_bearer_token()
+    if not device_id and not token:
+        return None
+    if not session_store.verify_device(device_id, token):
+        raise DeviceAuthError()
+    return device_id
+
+
+def require_device_auth(view):
+    """Hard-requires valid device auth (unlike _resolve_authenticated_device,
+    used where an anonymous/global fallback makes no sense — managing a
+    specific device's own session)."""
+    @wraps(view)
+    def wrapper(*args, **kwargs):
+        device_id = request.headers.get('X-Device-Id', '').strip()
+        token = _extract_bearer_token()
+        if not session_store.verify_device(device_id, token):
+            return jsonify({'success': False, 'message': 'Invalid or missing device authentication.',
+                             'error_code': 'DEVICE_AUTH_FAILED'}), 401
+        g.device_id = device_id
+        return view(*args, **kwargs)
+    return wrapper
+
+
+def _prepare_request_cookiefile(device_id):
+    """Returns (cookiefile_path_or_None, is_device_specific, cleanup_fn). The
+    returned cleanup_fn must always be called (in a finally:) once the yt-dlp
+    call is done — it deletes the per-request temp file for a device session,
+    and is a no-op when falling back to the shared global cookiefile (which
+    is reused across requests and must not be deleted here)."""
+    if device_id:
+        cookie_text = session_store.load_session_cookies(device_id)
+        if cookie_text:
+            fd, path = tempfile.mkstemp(prefix='ytcookies_dev_', suffix='.txt', dir=TEMP_DIR)
+            with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                f.write(cookie_text)
+            os.chmod(path, 0o600)
+
+            def _cleanup():
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+            return path, True, _cleanup
+    return YOUTUBE_COOKIE_FILE, False, (lambda: None)
+
+
+# Bot-check/auth-ish errors are only actionable by the affected user when a
+# device-specific session was in play — remap those to a distinct code so the
+# extension can say "reconnect your session" instead of a generic failure.
+_SESSION_EXPIRY_CODES = {'YOUTUBE_BOT_CHECK', 'YOUTUBE_COOKIES_EXPIRED', 'YOUTUBE_AUTH_REQUIRED'}
+
+
+def _remap_session_error(code, friendly, is_device_specific):
+    if is_device_specific and code in _SESSION_EXPIRY_CODES:
+        return 'YOUTUBE_SESSION_EXPIRED', 'Your YouTube session needs to be reconnected.'
+    return code, friendly
+
+
 _QUALITY_LABELS = {2160: '2160p / 4K', 1440: '1440p / 2K', 1080: '1080p', 720: '720p', 480: '480p', 360: '360p', 240: '240p', 144: '144p'}
 _ILLEGAL_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
@@ -280,7 +365,10 @@ def sanitize_filename(name, max_len=150):
     return name[:max_len] if name else 'download'
 
 
-def _yt_base_opts():
+def _yt_base_opts(cookiefile=None):
+    """cookiefile: per-request override (a device's own session). Defaults to
+    the shared global/admin cookiefile (YOUTUBE_COOKIE_FILE) when omitted, so
+    every yt-dlp call site keeps working unchanged unless it opts in."""
     opts = {
         'quiet': False,
         'no_warnings': False,
@@ -291,19 +379,20 @@ def _yt_base_opts():
         'retries': YT_RETRIES,
         'fragment_retries': YT_RETRIES,
     }
-    if YOUTUBE_COOKIE_FILE:
-        opts['cookiefile'] = YOUTUBE_COOKIE_FILE
+    cf = cookiefile if cookiefile is not None else YOUTUBE_COOKIE_FILE
+    if cf:
+        opts['cookiefile'] = cf
     if _DENO_AVAILABLE:
         # EJS solver for YouTube's JS challenges (needs the deno binary on PATH)
         opts['remote_components'] = {'ejs:github'}
         opts['js_runtimes'] = {'deno': {}}
     return opts
 
-def get_youtube_qualities(url, download_id=None):
+def get_youtube_qualities(url, download_id=None, cookiefile=None):
     """Return (title, [{height, label}]) using only resolutions that really exist."""
     tag = download_id or uuid.uuid4().hex[:8]
     logger.info(f'[{tag}] STARTING YT-DLP - metadata-only extract_info for {url}')
-    opts = {**_yt_base_opts(), 'logger': _YtDlpLogBridge(tag)}
+    opts = {**_yt_base_opts(cookiefile=cookiefile), 'logger': _YtDlpLogBridge(tag)}
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=False)
@@ -614,12 +703,14 @@ class _YtDlpLogBridge:
 
 
 # --- YouTube Downloader ---
-def download_youtube(url, mode="video", quality=None, compatibility=False, download_id=None):
+def download_youtube(url, mode="video", quality=None, compatibility=False, download_id=None, cookiefile=None):
     """
     quality: requested max height (e.g. 1080, 2160) or None for best available.
     compatibility: True forces MP4 + H.264 + AAC output; False preserves source codecs.
     download_id: caller-supplied id (so the frontend can poll GET /progress/<id> for this
     run before this function returns) — generated here if the caller didn't supply one.
+    cookiefile: per-request cookie file override (a device's own session), or None to use
+    the shared global/admin cookiefile.
     Returns (success, dict) — see call sites for the two possible dict shapes.
     """
     download_id = download_id or uuid.uuid4().hex
@@ -637,7 +728,7 @@ def download_youtube(url, mode="video", quality=None, compatibility=False, downl
         if mode == "audio":
             logger.info(f'[{download_id}] FETCHING FORMATS - {url}')
             ydl_opts = {
-                **_yt_base_opts(),
+                **_yt_base_opts(cookiefile=cookiefile),
                 'format': 'bestaudio/best',
                 'outtmpl': os.path.join(work_dir, 'audio.%(ext)s'),
                 'progress_hooks': [progress_hook],
@@ -678,7 +769,7 @@ def download_youtube(url, mode="video", quality=None, compatibility=False, downl
 
         # --- video mode ---
         logger.info(f'[{download_id}] FETCHING FORMATS - {url}')
-        title, qualities = get_youtube_qualities(url, download_id=download_id)
+        title, qualities = get_youtube_qualities(url, download_id=download_id, cookiefile=cookiefile)
         if not qualities:
             raise DownloadError('VIDEO_STREAM_MISSING', 'No video formats available for this URL')
 
@@ -700,7 +791,7 @@ def download_youtube(url, mode="video", quality=None, compatibility=False, downl
         logger.info(f'[{download_id}] FORMAT SELECTED - {format_selector} (compatibility={compatibility})')
 
         ydl_opts = {
-            **_yt_base_opts(),
+            **_yt_base_opts(cookiefile=cookiefile),
             'format': format_selector,
             'outtmpl': os.path.join(work_dir, 'source.%(ext)s'),
             'progress_hooks': [progress_hook],
@@ -1115,7 +1206,10 @@ def get_progress(download_id):
 @app.errorhandler(Exception)
 def handle_unexpected_error(e):
     if isinstance(e, HTTPException):
-        return e
+        # e.g. the 413 from MAX_CONTENT_LENGTH on an oversized /youtube/session upload —
+        # keep every error response JSON, never Werkzeug's default HTML error page.
+        return jsonify({'success': False, 'message': e.description or e.name,
+                         'error_code': f'HTTP_{e.code}'}), e.code
     logger.error(f'UNHANDLED EXCEPTION - {e}\n{traceback.format_exc()}')
     return jsonify({'success': False, 'message': 'An unexpected server error occurred.', 'error_code': 'INTERNAL_ERROR'}), 500
 
@@ -1124,22 +1218,93 @@ def handle_unexpected_error(e):
 def index():
     return 'Backend is running', 200
 
+
+@app.route('/device/register', methods=['POST'])
+def device_register():
+    """First-run bootstrap: the extension calls this once per installation and
+    persists the returned device_id/device_token in chrome.storage.local. No
+    auth required here — this endpoint's whole job is to hand out a new
+    identity. Rate-limited like everything else so it can't be used to spam
+    device records."""
+    if _is_rate_limited(request.remote_addr):
+        return jsonify({'success': False, 'message': 'Too many requests, please slow down.', 'error_code': 'RATE_LIMITED'}), 429
+    device_id, token = session_store.register_device()
+    logger.info(f'DEVICE REGISTERED - device_id={device_id}')
+    return jsonify({'success': True, 'device_id': device_id, 'device_token': token})
+
+
+@app.route('/youtube/session', methods=['POST'])
+@require_device_auth
+def youtube_session_connect():
+    """Stores this device's own YouTube cookies (Netscape format), encrypted at
+    rest. Only ever called from the extension's explicit "Connect YouTube
+    Session" flow — never triggered automatically."""
+    if _is_rate_limited(request.remote_addr):
+        return jsonify({'success': False, 'message': 'Too many requests, please slow down.', 'error_code': 'RATE_LIMITED'}), 429
+
+    data = request.get_json(silent=True) or {}
+    cookie_text = data.get('cookies')
+    if not isinstance(cookie_text, str) or not cookie_text.strip():
+        return jsonify({'success': False, 'message': 'A "cookies" field with your Netscape-format cookies.txt contents is required.',
+                         'error_code': 'INVALID_SESSION_DATA'}), 400
+    if len(cookie_text.encode('utf-8')) > session_store.MAX_COOKIE_BYTES:
+        return jsonify({'success': False, 'message': 'Cookie data is too large.', 'error_code': 'SESSION_TOO_LARGE'}), 413
+    if not session_store.looks_like_netscape_cookiefile(cookie_text):
+        return jsonify({'success': False, 'message': 'That does not look like a valid Netscape-format cookies.txt file.',
+                         'error_code': 'INVALID_SESSION_FORMAT'}), 400
+
+    try:
+        session_store.save_session(g.device_id, cookie_text)
+    except RuntimeError:
+        logger.error(f'YOUTUBE SESSION SAVE FAILED - device_id={g.device_id} - server misconfigured (SESSION_ENCRYPTION_KEY)')
+        return jsonify({'success': False, 'message': 'The server is not configured to store sessions right now.',
+                         'error_code': 'SERVER_MISCONFIGURED'}), 500
+
+    logger.info(f'YOUTUBE SESSION CONNECTED - device_id={g.device_id}')
+    return jsonify({'success': True, 'message': 'YouTube session connected.'})
+
+
+@app.route('/youtube/session/status', methods=['GET'])
+@require_device_auth
+def youtube_session_status():
+    return jsonify({'success': True, **session_store.session_status(g.device_id)})
+
+
+@app.route('/youtube/session', methods=['DELETE'])
+@require_device_auth
+def youtube_session_disconnect():
+    session_store.delete_session(g.device_id)
+    logger.info(f'YOUTUBE SESSION DISCONNECTED - device_id={g.device_id}')
+    return jsonify({'success': True, 'message': 'YouTube session disconnected.'})
+
+
 @app.route('/youtube/qualities', methods=['POST'])
 def youtube_qualities():
     if _is_rate_limited(request.remote_addr):
         return jsonify({'success': False, 'message': 'Too many requests, please slow down.', 'error_code': 'RATE_LIMITED'}), 429
 
+    try:
+        device_id = _resolve_authenticated_device()
+    except DeviceAuthError:
+        return jsonify({'success': False, 'message': 'Invalid or missing device authentication.',
+                         'error_code': 'DEVICE_AUTH_FAILED'}), 401
+
     data = request.get_json() or {}
     url = data.get('url')
     if not url:
         return jsonify({'success': False, 'message': 'URL is required'})
+
+    cookiefile, is_device_specific, cleanup = _prepare_request_cookiefile(device_id)
     try:
-        title, qualities = get_youtube_qualities(url)
+        title, qualities = get_youtube_qualities(url, cookiefile=cookiefile)
         return jsonify({'success': True, 'title': title, 'qualities': qualities})
     except Exception as e:
         code, friendly = classify_youtube_error(e)
+        code, friendly = _remap_session_error(code, friendly, is_device_specific)
         logger.error(f'YOUTUBE QUALITIES FAILED - {code}: {e}')
         return jsonify({'success': False, 'message': friendly, 'error_code': code}), 422
+    finally:
+        cleanup()
 
 @app.route('/download', methods=['POST'])
 def download():
@@ -1161,6 +1326,12 @@ def download():
 
     try:
         if platform == 'youtube':
+            try:
+                device_id = _resolve_authenticated_device()
+            except DeviceAuthError:
+                return jsonify({'success': False, 'message': 'Invalid or missing device authentication.',
+                                 'error_code': 'DEVICE_AUTH_FAILED'}), 401
+
             mode = 'audio' if content_type == 'audio' else 'video'
             quality = data.get('quality')
             quality = int(quality) if quality else None
@@ -1193,16 +1364,22 @@ def download():
             progress_id = requested_id if requested_id and _DOWNLOAD_ID_RE.match(requested_id) else uuid.uuid4().hex
             _set_progress(progress_id, 'starting', percent=0, message='Starting download...')
 
-            success, result = download_youtube(
-                url,
-                mode,
-                quality=quality,
-                compatibility=compatibility,
-                download_id=progress_id
-            )
+            cookiefile, is_device_specific, cleanup = _prepare_request_cookiefile(device_id)
+            try:
+                success, result = download_youtube(
+                    url,
+                    mode,
+                    quality=quality,
+                    compatibility=compatibility,
+                    download_id=progress_id,
+                    cookiefile=cookiefile,
+                )
+            finally:
+                cleanup()
 
             if not success:
-                return jsonify({'success': False, 'message': result['message'], 'error_code': result['code']}), 422
+                code, message = _remap_session_error(result['code'], result['message'], is_device_specific)
+                return jsonify({'success': False, 'message': message, 'error_code': code}), 422
 
             safe_download_name = make_safe_filename(result['download_name'])
             download_id = register_download_file(result['path'], safe_download_name, result['temp_dir'])

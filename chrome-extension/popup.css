@@ -220,3 +220,24 @@ body {
 @keyframes spin { to { transform: rotate(360deg); } }
 
 #error-box { margin-top: 10px; }
+
+.cookies-textarea {
+  width: 100%;
+  resize: vertical;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  font-size: 10px;
+  padding: 8px;
+  margin-bottom: 8px;
+}
+
+#connect-session-form .btn { margin-bottom: 6px; }
+
+.notice-success {
+  background: rgba(34, 197, 94, 0.12);
+  border-color: var(--success);
+  color: var(--success);
+}

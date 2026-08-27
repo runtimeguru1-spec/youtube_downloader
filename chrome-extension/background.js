@@ -11,6 +11,65 @@ function log(...args) {
   if (DEV_MODE) console.log('[YT-DL/bg]', ...args);
 }
 
+// ---- Per-device identity ----
+// Every extension installation gets its own device_id + secret device_token
+// from POST /device/register, persisted in chrome.storage.local so it
+// survives browser restarts. This is what lets the backend give each office
+// PC its own YouTube session instead of one shared global cookie set — the
+// user still has to explicitly connect that session (see popup.js), this
+// step only establishes *which device* is asking.
+async function ensureDevice() {
+  const stored = await chrome.storage.local.get(['device_id', 'device_token']);
+  if (stored.device_id && stored.device_token) {
+    return { device_id: stored.device_id, device_token: stored.device_token };
+  }
+  log('no device identity yet, registering');
+  const response = await fetch(`${BACKEND_URL}/device/register`, { method: 'POST' });
+  const data = await response.json();
+  if (!data.success) throw new Error(data.message || 'Device registration failed.');
+  await chrome.storage.local.set({ device_id: data.device_id, device_token: data.device_token });
+  log('device registered', data.device_id);
+  return { device_id: data.device_id, device_token: data.device_token };
+}
+
+async function authHeaders(extra = {}) {
+  const { device_id, device_token } = await ensureDevice();
+  return { 'X-Device-Id': device_id, 'Authorization': `Bearer ${device_token}`, ...extra };
+}
+
+async function checkQualities(url) {
+  const headers = await authHeaders({ 'Content-Type': 'application/json' });
+  const response = await fetch(`${BACKEND_URL}/youtube/qualities`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({ url }),
+  });
+  const data = await response.json();
+  return { ok: response.ok, data };
+}
+
+async function connectSession(cookiesText) {
+  const headers = await authHeaders({ 'Content-Type': 'application/json' });
+  const response = await fetch(`${BACKEND_URL}/youtube/session`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({ cookies: cookiesText }),
+  });
+  return response.json();
+}
+
+async function disconnectSession() {
+  const headers = await authHeaders();
+  const response = await fetch(`${BACKEND_URL}/youtube/session`, { method: 'DELETE', headers });
+  return response.json();
+}
+
+async function getSessionStatus() {
+  const headers = await authHeaders();
+  const response = await fetch(`${BACKEND_URL}/youtube/session/status`, { method: 'GET', headers });
+  return response.json();
+}
+
 function basename(path) {
   if (!path) return '';
   return path.split(/[\\/]/).pop();
@@ -71,9 +130,10 @@ async function startDownload(videoUrl, payload) {
 
   let data;
   try {
+    const headers = await authHeaders({ 'Content-Type': 'application/json' });
     const response = await fetch(`${BACKEND_URL}/download`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers,
       body: JSON.stringify(payload),
     });
     data = await response.json();
@@ -189,6 +249,30 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   }
   if (message?.type === 'CLEAR_STATE') {
     setState(message.videoUrl, { status: 'idle' }).then(() => sendResponse({ ok: true }));
+    return true;
+  }
+  if (message?.type === 'CHECK_QUALITIES') {
+    checkQualities(message.url)
+      .then(sendResponse)
+      .catch((e) => sendResponse({ ok: false, data: { success: false, message: e.message } }));
+    return true;
+  }
+  if (message?.type === 'CONNECT_SESSION') {
+    connectSession(message.cookies)
+      .then(sendResponse)
+      .catch((e) => sendResponse({ success: false, message: e.message }));
+    return true;
+  }
+  if (message?.type === 'DISCONNECT_SESSION') {
+    disconnectSession()
+      .then(sendResponse)
+      .catch((e) => sendResponse({ success: false, message: e.message }));
+    return true;
+  }
+  if (message?.type === 'SESSION_STATUS') {
+    getSessionStatus()
+      .then(sendResponse)
+      .catch((e) => sendResponse({ success: false, message: e.message }));
     return true;
   }
   return false;

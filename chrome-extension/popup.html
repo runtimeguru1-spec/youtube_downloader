@@ -16,11 +16,27 @@
   </div>
 
   <div id="backend-offline" class="notice notice-error hidden">
-    Downloader backend is not running. Start the local server and try again.
+    Could not reach the downloader backend. Check your connection and try again.
     <button id="retry-backend-btn" class="btn btn-link">Retry</button>
   </div>
 
   <main id="main-content" class="hidden">
+    <section id="session-section" class="field">
+      <label>YouTube Session</label>
+      <div id="session-status" class="notice">Checking session status…</div>
+      <button id="connect-session-btn" class="btn btn-primary hidden">Connect YouTube Session</button>
+      <button id="disconnect-session-btn" class="btn btn-link hidden">Disconnect this session</button>
+
+      <div id="connect-session-form" class="hidden">
+        <p class="video-url" style="white-space:normal;margin-bottom:6px;">
+          Paste the contents of your own exported <code>cookies.txt</code> (Netscape format, from being signed into YouTube). It's encrypted and stored only for this device.
+        </p>
+        <textarea id="session-cookies-input" class="cookies-textarea" rows="6" placeholder="# Netscape HTTP Cookie File&#10;.youtube.com	TRUE	/	TRUE	0	NAME	VALUE"></textarea>
+        <button id="submit-session-btn" class="btn btn-primary">Save Session</button>
+        <button id="cancel-session-btn" class="btn btn-link">Cancel</button>
+      </div>
+    </section>
+
     <div class="video-info">
       <div id="video-title" class="video-title">—</div>
       <div id="video-url" class="video-url">—</div>

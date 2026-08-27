@@ -1,5 +1,7 @@
 flask
 gunicorn
+redis
+cryptography
 yt-dlp
 instaloader
 selenium
