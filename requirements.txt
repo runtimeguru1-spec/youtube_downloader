@@ -2,7 +2,7 @@ flask
 gunicorn
 redis
 cryptography
-yt-dlp
+yt-dlp[default]
 instaloader
 selenium
 fake-useragent
